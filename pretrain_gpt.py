@@ -7,10 +7,12 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
+
 from megatron.core.strategy_selector import DynamicStrategySelector
 from megatron.core.model_profiler import ModelProfiler
 from megatron.core.hardware_profiler import HardwareProfiler
 from megatron.core.parallelism_manager import ParallelismManager
+
 from megatron.data.gpt_dataset import build_train_valid_test_datasets, build_dataset_group
 from megatron.enums import AttnMaskType
 from megatron.model import GPTModel, GPTModelPipe
