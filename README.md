@@ -127,7 +127,7 @@ The **Optimus-Megatron** workflow consists of three main phases:
     - Analyze runtime data to identify performance bottlenecks or inefficiencies.
     - Reconfigure parallelism strategies on the fly to address emerging issues and improve overall performance.
 
-**code sample code of the megatron core (dynamic parallelism training) integrated inside the training.py of megatron-deepspeed**
+**Sample code of the Megatron core (dynamic parallelism training) integrated inside the training.py of Megatron-DeepSpeed**
 
 ```python
 def setup_model_and_optimizer(model_provider_func,
