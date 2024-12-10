@@ -127,6 +127,54 @@ The **Optimus-Megatron** workflow consists of three main phases:
     - Analyze runtime data to identify performance bottlenecks or inefficiencies.
     - Reconfigure parallelism strategies on the fly to address emerging issues and improve overall performance.
 
+**code sample code of the megatron core (dynamic parallelism training) integrated inside the training.py of megatron-deepspeed**
+
+```python
+def setup_model_and_optimizer(model_provider_func,
+                            model_type,
+                            no_wd_decay_cond=None,
+                            scale_lr_cond=None,
+                            lr_mult=1.0):
+    """Setup model and optimizer with dynamic parallelism support."""
+    args = get_args()
+
+    # Initialize model
+    model = get_model(model_provider_func, model_type)
+
+    # Initialize profilers and managers
+    model_profiler = ModelProfiler(model)
+    hardware_profiler = HardwareProfiler()
+    parallelism_manager = ParallelismManager()
+
+    # Initialize dynamic strategy selector with profilers
+    if not hasattr(model, 'strategy_selector'):
+        model.strategy_selector = DynamicStrategySelector(
+            model,
+            model_profiler=model_profiler,
+            hardware_profiler=hardware_profiler,
+            parallelism_manager=parallelism_manager
+        )
+
+    # Setup optimizer with parallel state awareness
+    optimizer = get_megatron_optimizer(model, no_wd_decay_cond, scale_lr_cond, lr_mult)
+    lr_scheduler = get_learning_rate_scheduler(optimizer)
+
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model[0],
+            optimizer=optimizer,
+            args=args,
+            lr_scheduler=lr_scheduler,
+            mpu=mpu,
+            dist_init_required=False  # We've already initialized parallel groups
+        )
+        model = [model]
+    
+    return model, optimizer, lr_scheduler
+
+```
+
 ---
 
 ### **Evaluation and Proof of Concept**
