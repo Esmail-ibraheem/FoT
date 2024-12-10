@@ -4,7 +4,7 @@
 
 ### **Abstract**
 
-We present **"Optimus-Megatron"**, a novel dynamic framework designed to optimize the training of large-scale language models with billions of parameters. The framework leverages **dynamic parallelism**, an AI-driven system that automates the selection and adjustment of parallelism strategies—such as data parallelism, tensor model parallelism, and pipeline parallelism. These strategies are tailored to the specific requirements of model architecture, dataset size, and hardware constraints. By eliminating the need for manual configurations, **Optimus-Megatron** simplifies the training process and significantly enhances computational efficiency.
+in 2639 lines of code We present **"Optimus-Megatron"**, a novel dynamic framework designed to optimize the training of large-scale language models with billions of parameters integrated with Megatron-DeepSpeed. The framework leverages **dynamic parallelism**, an AI-driven system that automates the selection and adjustment of parallelism strategies—such as data parallelism, tensor model parallelism, and pipeline parallelism. These strategies are tailored to the specific requirements of model architecture, dataset size, and hardware constraints. By eliminating the need for manual configurations, **Optimus-Megatron** simplifies the training process and significantly enhances computational efficiency.
 
 **Example of the dynamic parallelism integrated with megatron**
 
