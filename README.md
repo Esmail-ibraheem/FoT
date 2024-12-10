@@ -6,6 +6,15 @@
 
 We present **"Optimus-Megatron"**, a novel dynamic framework designed to optimize the training of large-scale language models with billions of parameters. The framework leverages **dynamic parallelism**, an AI-driven system that automates the selection and adjustment of parallelism strategies—such as data parallelism, tensor model parallelism, and pipeline parallelism. These strategies are tailored to the specific requirements of model architecture, dataset size, and hardware constraints. By eliminating the need for manual configurations, **Optimus-Megatron** simplifies the training process and significantly enhances computational efficiency.
 
+**Example of the dynamic parallelism integrated with megatron**
+
+```python
+from megatron.core.strategy_selector import DynamicStrategySelector
+from megatron.core.model_profiler import ModelProfiler
+from megatron.core.hardware_profiler import HardwareProfiler
+from megatron.core.parallelism_manager import ParallelismManager
+```
+
 ---
 
 ### **Introduction**
@@ -45,6 +54,37 @@ The **Optimus-Megatron** framework departs from traditional static parallelism c
         - **Pipeline Parallelism** splits layers across GPUs.
         - **Data Parallelism** distributes batch data across GPUs within pipeline stages.
         - **Model Parallelism** partitions operations within individual layers.
+
+```python
+from megatron.core import ParallelismManager
+
+# Initialize the manager
+manager = ParallelismManager(
+    model=model,
+    dataset=dataset,
+    batch_size=initial_batch_size,
+    enable_dynamic_adaptation=True
+)
+
+# Initialize the framework
+manager.initialize()
+
+# During training
+for batch in dataloader:
+    # Train step
+    loss = train_step(batch)
+    
+    # Update parallelism manager with metrics
+    manager.step({
+        'throughput': samples_per_second,
+        'convergence_rate': loss_improvement,
+        'communication_overhead': communication_time,
+        'load_imbalance': load_imbalance_ratio
+    })
+
+# Cleanup
+manager.cleanup()
+```
 
 ---
 
