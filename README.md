@@ -171,7 +171,7 @@ By integrating profiling data from these dimensions, **Optimus-Megatron** demons
 
 ---
 
-### **Specific Innovations in Optimus-Megatron
+### Specific Innovations in Optimus-Megatron
 
 1. **Dynamic Switching During Training:**
     
