@@ -40,7 +40,6 @@ from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory, flops_calculator
 from megatron.global_vars import codecarbon_tracker_start, codecarbon_tracker_stop
 from megatron.data.dataset_utils import analyze_data_prefix
-
 from megatron.core.strategy_selector import DynamicStrategySelector
 from megatron.core.model_profiler import ModelProfiler
 from megatron.core.hardware_profiler import HardwareProfiler
