@@ -206,7 +206,7 @@ By integrating profiling data from these dimensions, **Optimus-Megatron** demons
 
 ### **Key Differences: Dynamic Parallelism vs. Hybrid Parallelism**
 
-|**Aspect**|**Hybrid Parallelism**|**Dynamic Parallelism (Your Research)**|
+|**Aspect**|**Hybrid Parallelism**|**Dynamic Parallelism**|
 |---|---|---|
 |**Definition**|Combines **static configurations** of multiple parallelism techniques (data, tensor, and pipeline) to optimize resource utilization during training.|Uses **dynamic, real-time adjustment** of parallelism techniques based on runtime metrics (e.g., GPU utilization, memory, and training phase).|
 |**Configuration**|Parallelism strategies (e.g., number of pipeline stages, tensor splits) are **fixed before training begins** and do not change during training.|Parallelism strategies are **adaptively chosen and adjusted** during training based on model size, dataset size, hardware, and runtime behavior.|
