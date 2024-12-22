@@ -1,8 +1,6 @@
 # [OptimusMegatron](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
 
-<div style="text-align: center;">
-  <img src="https://github.com/Esmail-ibraheem/OMegatron/blob/main/Optimus-Megatron.drawio.svg" alt="Description of the image">
-</div>
+
 
 
 ### Extending Megatron-DeepSpeed for Dynamic Parallelism in Training Multi-Billion Parameter Language Models.
