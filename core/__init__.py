@@ -1,18 +1,33 @@
 """
-Optimus-Megatron Dynamic Parallelism Framework
-This module implements dynamic parallelism strategies for efficient training of large language models.
+Core dynamic parallelism implementation
 """
 
-from .hardware_profiler import HardwareProfiler
+from .strategy_selector import (
+    DynamicStrategySelector,
+    ParallelismConfig,
+    MonitoringMetrics,
+)
+
 from .model_profiler import ModelProfiler
+from .hardware_profiler import HardwareProfiler
 from .dataset_profiler import DatasetProfiler
-from .strategy_selector import DynamicStrategySelector
-from .parallelism_manager import ParallelismManager
 
 __all__ = [
-    'HardwareProfiler',
-    'ModelProfiler',
-    'DatasetProfiler',
     'DynamicStrategySelector',
-    'ParallelismManager',
+    'ParallelismConfig',
+    'MonitoringMetrics',
+    'ParallelMode',
+    'HybridParallelEngine',
+    'TensorParallelLinear',
+    'PipelineParallel',
+    'ModelPartitioner',
+    'TensorParallelWrapper',
+    'PipelineParallelWrapper',
+    'HybridParallelWrapper',
+    'partition_model',
+    'TrainingCoordinator',
+    'TrainingState',
+    'ModelProfiler',
+    'HardwareProfiler',
+    'DatasetProfiler'
 ]

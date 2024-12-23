@@ -1,5 +1,5 @@
-""" 
-Strategy Selector for Optimus-Megatron with AI-driven decision making
+"""
+Strategy Selector for Dynamic Parallelism with AI-driven decision making
 """
 
 import torch
@@ -20,26 +20,12 @@ import torch.optim as optim
 from collections import deque
 import random
 
-# Megatron-specific imports
-from megatron import get_args
-from megatron.mpu import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_data_parallel_group,
-    get_data_parallel_world_size,
-    get_data_parallel_rank,
-    get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_world_size,
-    get_pipeline_model_parallel_rank
-)
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger('MegatronStrategySelector')
+logger = logging.getLogger('DynamicStrategySelector')
 
 class Experience(NamedTuple):
     """Experience tuple for reinforcement learning."""
@@ -128,12 +114,11 @@ class RLAgent(nn.Module):
 
 class ParallelismType(Enum):
     """Types of parallelism supported."""
-    DATA = "data"
-    TENSOR = "tensor"
-    PIPELINE = "pipeline"
-    SEQUENCE = "sequence"
-    EXPERT = "expert"
-    ZERO = "zero"
+    DATA_PARALLEL = "data_parallel"
+    TENSOR_PARALLEL = "tensor_parallel"
+    PIPELINE_PARALLEL = "pipeline_parallel"
+    HYBRID = "hybrid"
+    NONE = "none"
 
 class ModelArchitecture(Enum):
     """Supported model architectures for specialized strategies."""
@@ -172,16 +157,129 @@ class HardwareCharacteristics:
 @dataclass
 class ParallelismConfig:
     """Parallelism configuration."""
-    strategy_type: ParallelismType
-    data_parallel_size: int
-    tensor_parallel_size: int
-    pipeline_parallel_size: int
-    micro_batch_size: int
-    gradient_accumulation_steps: int
-    zero_optimization_stage: int
-    activation_checkpointing: bool
-    cpu_offload: bool
-    communication_overlap: bool
+    def __init__(self,
+                strategy_type: ParallelismType,
+                data_parallel_size: int = 1,
+                tensor_parallel_size: int = 1,
+                pipeline_parallel_size: int = 1,
+                micro_batch_size: int = 1,
+                gradient_accumulation_steps: int = 1,
+                pipeline_chunks: int = 8,
+                zero_optimization_stage: int = 0,
+                activation_checkpointing: bool = False,
+                activation_checkpoint_layers: List[int] = None,
+                cpu_offload: bool = False,
+                communication_overlap: bool = True):
+        self.strategy_type = strategy_type
+        self.data_parallel_size = data_parallel_size
+        self.tensor_parallel_size = tensor_parallel_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.micro_batch_size = micro_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.pipeline_chunks = pipeline_chunks
+        self.zero_optimization_stage = zero_optimization_stage
+        self.activation_checkpointing = activation_checkpointing
+        self.activation_checkpoint_layers = activation_checkpoint_layers or []
+        self.cpu_offload = cpu_offload
+        self.communication_overlap = communication_overlap
+        
+    def validate(self, num_gpus: int) -> bool:
+        """Validate if the configuration is valid for given number of GPUs."""
+        total_parallel_size = (self.data_parallel_size * 
+                             self.tensor_parallel_size * 
+                             self.pipeline_parallel_size)
+        return total_parallel_size <= num_gpus
+
+    @property
+    def total_parallel_size(self) -> int:
+        """Total number of GPUs required."""
+        return (self.data_parallel_size * 
+                self.tensor_parallel_size * 
+                self.pipeline_parallel_size)
+                
+    def __eq__(self, other: 'ParallelismConfig') -> bool:
+        """Check if two configurations are equal."""
+        if not isinstance(other, ParallelismConfig):
+            return False
+        return (
+            self.strategy_type == other.strategy_type and
+            self.data_parallel_size == other.data_parallel_size and
+            self.tensor_parallel_size == other.tensor_parallel_size and
+            self.pipeline_parallel_size == other.pipeline_parallel_size and
+            self.micro_batch_size == other.micro_batch_size and
+            self.gradient_accumulation_steps == other.gradient_accumulation_steps and
+            self.pipeline_chunks == other.pipeline_chunks and
+            self.zero_optimization_stage == other.zero_optimization_stage and
+            self.activation_checkpointing == other.activation_checkpointing and
+            self.cpu_offload == other.cpu_offload and
+            self.communication_overlap == other.communication_overlap
+        )
+
+class ProcessGroup:
+    """Manages process groups for different types of parallelism using PyTorch distributed."""
+    
+    def __init__(self, world_size: int, config: ParallelismConfig):
+        self.world_size = world_size
+        self.config = config
+        self.rank = dist.get_rank() if dist.is_initialized() else 0
+        
+        self.data_parallel_group = None
+        self.tensor_parallel_group = None
+        self.pipeline_parallel_group = None
+        
+        if dist.is_initialized():
+            self._initialize_process_groups()
+    
+    def _initialize_process_groups(self):
+        """Initialize process groups for each type of parallelism using PyTorch distributed."""
+        # Data parallel group
+        dp_size = self.config.data_parallel_size
+        dp_groups = []
+        for i in range(self.world_size // dp_size):
+            ranks = list(range(i * dp_size, (i + 1) * dp_size))
+            group = dist.new_group(ranks=ranks)
+            dp_groups.append(group)
+        self.data_parallel_group = dp_groups[self.rank // dp_size]
+        
+        # Tensor parallel group
+        tp_size = self.config.tensor_parallel_size
+        if tp_size > 1:
+            tp_groups = []
+            ranks_per_tp = self.world_size // tp_size
+            for i in range(ranks_per_tp):
+                ranks = [i + j * ranks_per_tp for j in range(tp_size)]
+                group = dist.new_group(ranks=ranks)
+                tp_groups.append(group)
+            self.tensor_parallel_group = tp_groups[self.rank % ranks_per_tp]
+        
+        # Pipeline parallel group
+        pp_size = self.config.pipeline_parallel_size
+        if pp_size > 1:
+            pp_groups = []
+            ranks_per_pp = self.world_size // pp_size
+            for i in range(ranks_per_pp):
+                ranks = list(range(i, self.world_size, ranks_per_pp))
+                group = dist.new_group(ranks=ranks)
+                pp_groups.append(group)
+            self.pipeline_parallel_group = pp_groups[self.rank % ranks_per_pp]
+    
+    def get_data_parallel_rank(self) -> int:
+        """Get rank within data parallel group."""
+        if not self.data_parallel_group:
+            return 0
+        return dist.get_rank(group=self.data_parallel_group)
+    
+    def get_tensor_parallel_rank(self) -> int:
+        """Get rank within tensor parallel group."""
+        if not self.tensor_parallel_group:
+            return 0
+        return dist.get_rank(group=self.tensor_parallel_group)
+    
+    def get_pipeline_parallel_rank(self) -> int:
+        """Get rank within pipeline parallel group."""
+        if not self.pipeline_parallel_group:
+            return 0
+        return dist.get_rank(group=self.pipeline_parallel_group)
 
 class StrategyMonitor:
     """Monitors training metrics and system resources for strategy adaptation."""
@@ -489,23 +587,94 @@ class StrategyMonitor:
         
     def _action_to_strategy(self, action: int) -> Dict:
         """Convert RL action to concrete strategy configuration."""
-        # Example strategy mappings
         strategies = {
-            0: {'dp': 2, 'tp': 2, 'pp': 1},  # Balanced DP and TP
-            1: {'dp': 4, 'tp': 1, 'pp': 1},  # Heavy DP
-            2: {'dp': 1, 'tp': 4, 'pp': 1},  # Heavy TP
-            3: {'dp': 2, 'tp': 1, 'pp': 2},  # With Pipeline
-            4: {'dp': 1, 'tp': 2, 'pp': 2}   # Balanced PP and TP
+            0: {"type": ParallelismType.DATA_PARALLEL},
+            1: {"type": ParallelismType.TENSOR_PARALLEL},
+            2: {"type": ParallelismType.PIPELINE_PARALLEL},
+            3: {"type": ParallelismType.HYBRID},
+            4: {"type": ParallelismType.NONE}
         }
         return strategies[action]
         
     def _apply_strategy(self, strategy: Dict):
         """Apply the selected parallelism strategy."""
         logger.info(f"Applying new strategy: {strategy}")
-        # Implementation depends on your parallelism manager
-        pass
+        
+        # Create new ParallelismConfig from strategy
+        new_config = ParallelismConfig(
+            strategy_type=strategy['type'],
+            data_parallel_size=strategy.get('data_parallel_size', 1),
+            tensor_parallel_size=strategy.get('tensor_parallel_size', 1),
+            pipeline_parallel_size=strategy.get('pipeline_parallel_size', 1),
+            micro_batch_size=strategy.get('micro_batch_size', 1),
+            gradient_accumulation_steps=strategy.get('gradient_accumulation_steps', 1),
+            pipeline_chunks=strategy.get('pipeline_chunks', 8),
+            zero_optimization_stage=strategy.get('zero_stage', 0),
+            activation_checkpointing=strategy.get('activation_checkpointing', False),
+            activation_checkpoint_layers=strategy.get('checkpoint_layers', []),
+            cpu_offload=strategy.get('cpu_offload', False),
+            communication_overlap=strategy.get('communication_overlap', True)
+        )
+        
+        # Validate the new configuration
+        try:
+            new_config.validate(torch.cuda.device_count())
+        except ValueError as e:
+            logger.error(f"Invalid strategy configuration: {e}")
+            return False
+            
+        # Initialize new process groups
+        if self.process_groups is not None:
+            old_groups = self.process_groups
+            try:
+                self.process_groups = ProcessGroup(dist.get_world_size(), new_config)
+            except Exception as e:
+                logger.error(f"Failed to initialize new process groups: {e}")
+                self.process_groups = old_groups
+                return False
+                
+        # Apply configuration changes
+        if hasattr(self, 'parallelism_manager'):
+            try:
+                # Save model state
+                old_state = self.parallelism_manager.model.state_dict()
+                
+                # Apply new configuration
+                self.parallelism_manager.reconfigure(
+                    new_config,
+                    self.process_groups,
+                    preserve_state=True,
+                    old_state=old_state
+                )
+                
+                # Update current configuration
+                self.current_config = new_config
+                
+                # Log strategy change
+                self._log_strategy_change(new_config)
+                
+                # Record timestamp of change
+                self.strategy_changes.append((time.time(), new_config))
+                
+                logger.info("Successfully applied new parallelism strategy")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to apply new strategy: {e}")
+                # Attempt to rollback to previous state
+                try:
+                    self.parallelism_manager.model.load_state_dict(old_state)
+                    logger.info("Successfully rolled back to previous state")
+                except:
+                    logger.error("Failed to rollback to previous state")
+                return False
+        else:
+            logger.error("No parallelism manager available")
+            return False
 
 class DynamicStrategySelector:
+    """Manages dynamic parallelism strategy selection and transitions."""
+    
     def __init__(self, 
                  monitoring_interval: int = 100,  # iterations
                  adaptation_threshold: float = 0.15,  # 15% performance change
@@ -523,506 +692,287 @@ class DynamicStrategySelector:
         self.metrics_queue: Queue = Queue()
         self.stop_monitoring = threading.Event()
         
-        # Initialize logger
+        self.process_groups: Optional[ProcessGroup] = None
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         
         self.monitor = StrategyMonitor()
-        self.monitor.start_monitoring()
         
-    def initialize_strategy(self, 
-                          model_size: int,
-                          batch_size: int,
-                          num_gpus: int,
-                          gpu_memory: int,
-                          network_bandwidth: float) -> ParallelismConfig:
-        """Initialize the parallelism strategy based on initial conditions."""
-        # Calculate basic resource requirements
-        params_memory = model_size * 4  # 4 bytes per parameter
-        available_memory = gpu_memory * 0.85  # Use 85% of GPU memory
+    def initialize_strategy(self, model_characteristics: ModelCharacteristics,
+                          hardware_characteristics: HardwareCharacteristics) -> ParallelismConfig:
+        """Initialize parallelism strategy based on model and hardware characteristics."""
+        num_gpus = hardware_characteristics.num_gpus
+        gpu_memory = hardware_characteristics.gpu_memory
+        model_size = model_characteristics.parameter_size
         
-        # Determine initial parallelism configuration
-        if model_size > 1e10:  # Very large model (>10B parameters)
-            config = self._configure_large_model(model_size, num_gpus, available_memory)
-        elif model_size > 1e9:  # Large model (1-10B parameters)
-            config = self._configure_medium_model(model_size, num_gpus, available_memory)
-        else:  # Small to medium model (<1B parameters)
-            config = self._configure_small_model(model_size, num_gpus, available_memory)
-        
+        if model_size > 10:  # >10B parameters
+            config = self._configure_large_model(model_size, num_gpus, gpu_memory)
+        elif model_size > 1:  # 1-10B parameters
+            config = self._configure_medium_model(model_size, num_gpus, gpu_memory)
+        else:  # <1B parameters
+            config = self._configure_small_model(model_size, num_gpus, gpu_memory)
+            
         self.current_config = config
+        self.process_groups = ProcessGroup(num_gpus, config)
         return config
-
+    
     def _configure_large_model(self, model_size: int, num_gpus: int, 
-                             available_memory: int) -> ParallelismConfig:
+                             gpu_memory: int) -> ParallelismConfig:
         """Configure parallelism for very large models (>10B parameters)."""
-        # Use hybrid parallelism for large models
-        pipeline_parallel_size = min(8, num_gpus // 4)
-        tensor_parallel_size = min(8, num_gpus // pipeline_parallel_size)
-        data_parallel_size = num_gpus // (pipeline_parallel_size * tensor_parallel_size)
+        # For large models, prioritize model parallelism
+        tp_size = min(8, num_gpus)  # Up to 8-way tensor parallelism
+        remaining_gpus = num_gpus // tp_size
+        
+        pp_size = min(4, remaining_gpus)  # Up to 4 pipeline stages
+        dp_size = num_gpus // (tp_size * pp_size)
         
         return ParallelismConfig(
             strategy_type=ParallelismType.HYBRID,
-            data_parallel_size=data_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            data_parallel_size=dp_size,
             micro_batch_size=1,
             gradient_accumulation_steps=32,
-            zero_optimization_stage=3,
-            activation_checkpointing=True,
-            cpu_offload=True,
-            communication_overlap=True
+            zero_optimization_stage=1,
+            activation_checkpointing=True
         )
-
+    
     def _configure_medium_model(self, model_size: int, num_gpus: int, 
-                              available_memory: int) -> ParallelismConfig:
-        """Configure parallelism for large models (1-10B parameters)."""
-        # Use combination of tensor and data parallelism
-        tensor_parallel_size = min(4, num_gpus // 2)
-        data_parallel_size = num_gpus // tensor_parallel_size
+                              gpu_memory: int) -> ParallelismConfig:
+        """Configure parallelism for medium models (1-10B parameters)."""
+        # Balance between data and model parallelism
+        tp_size = min(4, num_gpus)  # Up to 4-way tensor parallelism
+        remaining_gpus = num_gpus // tp_size
+        
+        pp_size = min(2, remaining_gpus)  # Up to 2 pipeline stages
+        dp_size = num_gpus // (tp_size * pp_size)
         
         return ParallelismConfig(
             strategy_type=ParallelismType.HYBRID,
-            data_parallel_size=data_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=1,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            data_parallel_size=dp_size,
             micro_batch_size=4,
             gradient_accumulation_steps=16,
-            zero_optimization_stage=2,
-            activation_checkpointing=True,
-            cpu_offload=False,
-            communication_overlap=True
+            zero_optimization_stage=2
         )
-
+    
     def _configure_small_model(self, model_size: int, num_gpus: int, 
-                             available_memory: int) -> ParallelismConfig:
-        """Configure parallelism for small to medium models (<1B parameters)."""
-        # Primarily use data parallelism
+                             gpu_memory: int) -> ParallelismConfig:
+        """Configure parallelism for small models (<1B parameters)."""
+        # Prioritize data parallelism for small models
         return ParallelismConfig(
-            strategy_type=ParallelismType.DATA,
+            strategy_type=ParallelismType.DATA_PARALLEL,
             data_parallel_size=num_gpus,
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             micro_batch_size=32,
             gradient_accumulation_steps=1,
-            zero_optimization_stage=1,
-            activation_checkpointing=False,
-            cpu_offload=False,
-            communication_overlap=True
+            zero_optimization_stage=2
         )
-
-    def select_optimal_strategy(self, model_profile: Dict, 
-                              dataset_profile: Dict, 
-                              hardware_profile: Dict) -> Dict:
-        """Select optimal parallelization strategy based on profiles."""
-        args = get_args()
-        
-        # Get current parallel configurations
-        tp_size = get_tensor_model_parallel_world_size()
-        dp_size = get_data_parallel_world_size()
-        pp_size = get_pipeline_model_parallel_world_size()
-        
-        # Calculate memory requirements
-        memory_per_gpu = hardware_profile['gpu_info']['gpu_0']['total_memory']
-        model_memory = model_profile['total_parameters'] * 4  # 4 bytes per parameter
-        activation_memory = model_profile['activation_memory']
-        optimizer_memory = model_memory * 2  # Adam optimizer states
-        
-        # Calculate communication costs
-        tp_comm_cost = self._calculate_tp_communication_cost(
-            model_profile, hardware_profile)
-        pp_comm_cost = self._calculate_pp_communication_cost(
-            model_profile, hardware_profile)
-        dp_comm_cost = self._calculate_dp_communication_cost(
-            model_profile, dataset_profile, hardware_profile)
-        
-        # Determine optimal strategy
-        strategy = {
-            'tensor_parallel': {
-                'size': self._optimize_tp_size(
-                    model_profile, memory_per_gpu, tp_comm_cost),
-                'comm_cost': tp_comm_cost
-            },
-            'pipeline_parallel': {
-                'size': self._optimize_pp_size(
-                    model_profile, memory_per_gpu, pp_comm_cost),
-                'num_micro_batches': self._calculate_optimal_micro_batches(
-                    model_profile, dataset_profile),
-                'comm_cost': pp_comm_cost
-            },
-            'data_parallel': {
-                'size': self._optimize_dp_size(
-                    dataset_profile, memory_per_gpu, dp_comm_cost),
-                'comm_cost': dp_comm_cost
-            }
-        }
-        
-        # Add Megatron-specific optimizations
-        strategy.update({
-            'activation_checkpointing': {
-                'enabled': model_memory > memory_per_gpu * 0.3,
-                'granularity': 'selective' if model_memory < memory_per_gpu * 0.6 else 'full'
-            },
-            'zero_optimization': {
-                'stage': self._determine_zero_stage(model_memory, memory_per_gpu),
-                'contiguous_gradients': True,
-                'overlap_comm': True
-            },
-            'mixed_precision': {
-                'enabled': True,
-                'dtype': 'fp16' if model_profile['supports_half'] else 'bf16'
-            }
-        })
-        
-        return strategy
-
-    def _optimize_tp_size(self, model_profile: Dict, 
-                         memory_per_gpu: int, 
-                         comm_cost: float) -> int:
-        """Optimize tensor parallel size based on model and hardware characteristics."""
-        if not dist.is_initialized():
-            return 1
-            
-        total_gpus = torch.cuda.device_count()
-        if total_gpus < 2:
-            return 1
-            
-        max_tp_size = min(
-            total_gpus,
-            model_profile['largest_layer_params'] // (memory_per_gpu * 0.1)
-        )
-        
-        # Consider communication overhead
-        if comm_cost > 0.2:  # If comm cost is more than 20% of compute
-            max_tp_size = min(max_tp_size, total_gpus // 2)
-        
-        # Ensure tp_size is a power of 2
-        tp_size = 1
-        while tp_size * 2 <= max_tp_size:
-            tp_size *= 2
-        
-        return tp_size
-
-    def _optimize_pp_size(self, model_profile: Dict, 
-                         memory_per_gpu: int, 
-                         comm_cost: float) -> int:
-        """Optimize pipeline parallel size based on model characteristics."""
-        if not dist.is_initialized():
-            return 1
-            
-        total_gpus = torch.cuda.device_count()
-        if total_gpus < 2:
-            return 1
-            
-        num_layers = model_profile['num_layers']
-        if num_layers < 2:
-            return 1
-        
-        # Calculate minimum GPUs needed for memory
-        min_gpus_memory = max(1, model_profile['total_parameters'] * 4 // memory_per_gpu)
-        
-        # Consider pipeline bubble overhead
-        if comm_cost > 0.1:  # If comm cost is more than 10% of compute
-            max_pp_size = min(num_layers // 4, total_gpus // 2)
-        else:
-            max_pp_size = min(num_layers // 2, total_gpus)
-        
-        pp_size = max(1, min(min_gpus_memory, max_pp_size))
-        
-        return pp_size
-
-    def _determine_zero_stage(self, model_memory: int, 
-                            memory_per_gpu: int) -> int:
-        """Determine optimal ZeRO stage based on model and memory constraints."""
-        if not dist.is_initialized():
-            return 0
-            
-        memory_ratio = model_memory / memory_per_gpu
-        
-        if memory_ratio > 2.0:
-            return 3  # Use ZeRO-3 for very large models
-        elif memory_ratio > 1.0:
-            return 2  # Use ZeRO-2 for large models
-        elif memory_ratio > 0.5:
-            return 1  # Use ZeRO-1 for medium models
-        else:
-            return 0  # No ZeRO for small models
-
-    def _calculate_optimal_micro_batches(self, model_profile: Dict, 
-                                       dataset_profile: Dict) -> int:
-        """Calculate optimal number of micro-batches for pipeline parallelism."""
-        if not dist.is_initialized():
-            return 1
-            
-        pp_size = get_pipeline_model_parallel_world_size()
-        if pp_size <= 1:
-            return 1
-        
-        # Calculate based on pipeline bubble overhead
-        bubble_overhead = lambda num_mb: (pp_size - 1) / (pp_size * num_mb)
-        
-        # Start with 2x pipeline depth to minimize bubble
-        num_micro_batches = pp_size * 2
-        
-        # Increase if bubble overhead is still too high
-        while (bubble_overhead(num_micro_batches) > 0.05 and  # 5% overhead threshold
-               num_micro_batches < dataset_profile['batch_size']):
-            num_micro_batches *= 2
-        
-        return num_micro_batches
-
-    def start_monitoring(self):
-        """Start the monitoring thread for collecting training metrics."""
-        if not self.enable_dynamic_adaptation:
-            return
-
-        def monitoring_loop():
-            while not self.stop_monitoring.is_set():
-                metrics = self._collect_training_metrics()
-                self.metrics_queue.put(metrics)
-                time.sleep(self.monitoring_interval)
-
-        self.monitoring_thread = threading.Thread(target=monitoring_loop)
-        self.monitoring_thread.start()
-
-    def stop_monitoring(self):
-        """Stop the monitoring thread."""
-        if self.monitoring_thread is not None:
-            self.stop_monitoring.set()
-            self.monitoring_thread.join()
-
-    def _collect_training_metrics(self) -> MonitoringMetrics:
-        """Collect current training metrics."""
-        # Collect GPU metrics
-        gpu_memory_used = []
-        for i in range(torch.cuda.device_count()):
-            memory_allocated = torch.cuda.memory_allocated(i)
-            memory_total = torch.cuda.get_device_properties(i).total_memory
-            gpu_memory_used.append(memory_allocated / memory_total * 100)
-
-        # Collect CPU metrics
-        cpu_memory_used = psutil.virtual_memory().percent
-
-        # These metrics would need to be collected from the training loop
-        # Here we're using placeholder values
-        metrics = MonitoringMetrics(
-            timestamp=time.time(),
-            iteration=0,  # To be filled with actual iteration
-            throughput=0.0,  # To be filled with actual throughput
-            gpu_memory_used=gpu_memory_used,
-            gpu_utilization={},
-            communication_overhead=0.0,  # To be filled with actual overhead
-            pipeline_bubble_overhead=0.0,  # To be filled with actual bubble overhead
-            load_imbalance=0.0,  # To be filled with actual imbalance
-            tensor_parallel_efficiency=0.0,  # To be filled with actual efficiency
-            data_parallel_efficiency=0.0,  # To be filled with actual efficiency
-            gradient_sync_time=0.0,  # To be filled with actual sync time
-            batch_processing_time=0.0,  # To be filled with actual batch time
-            pipeline_stall_time=0.0,  # To be filled with actual stall time
-            memory_reserved={}
-        )
-        
-        return metrics
-
+    
     def update_metrics(self, metrics: MonitoringMetrics):
         """Update metrics history and trigger strategy adaptation if needed."""
         self.metrics_history.append(metrics)
         if len(self.metrics_history) > self.history_window:
             self.metrics_history.pop(0)
-
+        
         if self.enable_dynamic_adaptation and len(self.metrics_history) >= self.history_window:
             self._adapt_strategy()
-
+    
     def _adapt_strategy(self):
         """Adapt parallelism strategy based on collected metrics."""
+        if not self.enable_dynamic_adaptation or len(self.metrics_history) < self.history_window:
+            return
+            
         current_performance = self._evaluate_current_performance()
-        if self._should_adapt(current_performance):
-            new_config = self._select_new_strategy(current_performance)
-            if new_config != self.current_config:
-                self.strategy_changes.append((len(self.metrics_history), new_config))
-                self.current_config = new_config
-                self._log_strategy_change(new_config)
-
-    def _evaluate_current_performance(self) -> Dict[str, float]:
-        """Evaluate current training performance metrics."""
-        recent_metrics = self.metrics_history[-self.history_window:]
-        
-        return {
-            'throughput': np.mean([m.throughput for m in recent_metrics]),
-            'memory_efficiency': np.mean([np.mean(m.gpu_memory_used) for m in recent_metrics]),
-            'communication_efficiency': 1.0 - np.mean([m.communication_overhead for m in recent_metrics]),
-            'load_balance': 1.0 - np.mean([m.load_imbalance for m in recent_metrics]),
-            'convergence': np.mean([m.tensor_parallel_efficiency for m in recent_metrics])
-        }
-
-    def _should_adapt(self, current_performance: Dict[str, float]) -> bool:
-        """Determine if strategy adaptation is needed."""
-        if len(self.metrics_history) < self.history_window * 2:
-            return False
-
-        previous_performance = self._evaluate_performance(
-            self.metrics_history[-2*self.history_window:-self.history_window]
-        )
-
-        # Calculate relative changes in key metrics
-        changes = {
-            metric: abs(current_performance[metric] - previous_performance[metric]) / 
-                   previous_performance[metric]
-            for metric in current_performance
-        }
-
-        # Return True if any metric changed significantly
-        return any(change > self.adaptation_threshold for change in changes.values())
-
-    def _select_new_strategy(self, 
-                           current_performance: Dict[str, float]) -> ParallelismConfig:
-        """Select a new parallelism strategy based on current performance."""
-        if self.current_config is None:
-            return self._configure_small_model(1e8, torch.cuda.device_count(), 
-                                            torch.cuda.get_device_properties(0).total_memory)
-
-        # Identify performance bottlenecks
+        if not self._should_adapt(current_performance):
+            return
+            
         bottlenecks = self._identify_bottlenecks(current_performance)
+        new_config = self._adjust_strategy_for_bottlenecks(
+            self.current_config, bottlenecks
+        )
         
-        # Adjust strategy based on bottlenecks
-        new_config = self._adjust_strategy_for_bottlenecks(self.current_config, bottlenecks)
-        
-        return new_config
-
-    def _identify_bottlenecks(self, 
-                            performance: Dict[str, float]) -> Dict[str, float]:
-        """Identify performance bottlenecks from metrics."""
-        bottlenecks = {}
-        
-        # Memory bottleneck
-        if performance['memory_efficiency'] > 90:
-            bottlenecks['memory'] = performance['memory_efficiency'] / 100.0
+        if new_config != self.current_config:
+            self._log_strategy_change(new_config)
+            self.current_config = new_config
+            self.strategy_changes.append((len(self.metrics_history), new_config))
             
-        # Communication bottleneck
-        if performance['communication_efficiency'] < 0.7:
-            bottlenecks['communication'] = 1.0 - performance['communication_efficiency']
-            
-        # Load imbalance bottleneck
-        if performance['load_balance'] < 0.8:
-            bottlenecks['load_balance'] = 1.0 - performance['load_balance']
-            
-        return bottlenecks
-
-    def _adjust_strategy_for_bottlenecks(self, 
-                                       current_config: ParallelismConfig,
+    def _adjust_strategy_for_bottlenecks(self, current_config: ParallelismConfig,
                                        bottlenecks: Dict[str, float]) -> ParallelismConfig:
         """Adjust parallelism strategy to address identified bottlenecks."""
         new_config = current_config
         
-        if 'memory' in bottlenecks:
+        # Memory bottleneck
+        if bottlenecks.get('memory', 0) > 0.8:  # 80% memory usage
             new_config = self._adjust_for_memory_bottleneck(new_config)
-        
-        if 'communication' in bottlenecks:
+            
+        # Communication bottleneck
+        elif bottlenecks.get('communication', 0) > 0.3:  # 30% comm overhead
             new_config = self._adjust_for_communication_bottleneck(new_config)
             
-        if 'load_balance' in bottlenecks:
-            new_config = self._adjust_for_load_imbalance(new_config)
+        # GPU utilization bottleneck
+        elif bottlenecks.get('utilization', 0) < 0.5:  # 50% utilization
+            new_config = self._adjust_for_utilization_bottleneck(new_config)
             
         return new_config
-
-    def _adjust_for_memory_bottleneck(self, 
-                                    config: ParallelismConfig) -> ParallelismConfig:
+        
+    def _adjust_for_memory_bottleneck(self, config: ParallelismConfig) -> ParallelismConfig:
         """Adjust strategy to address memory bottleneck."""
-        # Try increasing model parallelism first
-        if config.tensor_parallel_size < 4:
+        if config.strategy_type == ParallelismType.DATA_PARALLEL:
+            # Switch to tensor parallel to reduce memory per GPU
             return ParallelismConfig(
-                **{**config.__dict__,
-                   'tensor_parallel_size': config.tensor_parallel_size * 2,
-                   'data_parallel_size': config.data_parallel_size // 2,
-                   'activation_checkpointing': True}
+                strategy_type=ParallelismType.TENSOR_PARALLEL,
+                tensor_parallel_size=min(config.data_parallel_size, 4),
+                pipeline_parallel_size=1,
+                activation_checkpointing=True
             )
-        # If model parallelism is maxed out, try pipeline parallelism
-        elif config.pipeline_parallel_size < 4:
+        elif config.strategy_type == ParallelismType.TENSOR_PARALLEL:
+            # Add pipeline parallel to further reduce memory
             return ParallelismConfig(
-                **{**config.__dict__,
-                   'pipeline_parallel_size': config.pipeline_parallel_size * 2,
-                   'data_parallel_size': config.data_parallel_size // 2}
+                strategy_type=ParallelismType.HYBRID,
+                tensor_parallel_size=config.tensor_parallel_size,
+                pipeline_parallel_size=2,
+                activation_checkpointing=True
             )
-        # If both are maxed out, enable CPU offloading
-        else:
-            return ParallelismConfig(
-                **{**config.__dict__,
-                   'cpu_offload': True,
-                   'zero_optimization_stage': 3}
-            )
-
-    def _adjust_for_communication_bottleneck(self, 
-                                          config: ParallelismConfig) -> ParallelismConfig:
+        return config
+        
+    def _adjust_for_communication_bottleneck(self, config: ParallelismConfig) -> ParallelismConfig:
         """Adjust strategy to address communication bottleneck."""
-        # Increase gradient accumulation to reduce communication frequency
-        return ParallelismConfig(
-            **{**config.__dict__,
-               'gradient_accumulation_steps': config.gradient_accumulation_steps * 2,
-               'communication_overlap': True}
-        )
-
-    def _adjust_for_load_imbalance(self, 
-                                 config: ParallelismConfig) -> ParallelismConfig:
-        """Adjust strategy to address load imbalance."""
-        # Reduce pipeline stages if pipeline parallelism is causing imbalance
-        if config.pipeline_parallel_size > 1:
+        if config.strategy_type == ParallelismType.DATA_PARALLEL:
+            # Reduce data parallel size and add pipeline parallel
             return ParallelismConfig(
-                **{**config.__dict__,
-                   'pipeline_parallel_size': config.pipeline_parallel_size // 2,
-                   'data_parallel_size': config.data_parallel_size * 2}
+                strategy_type=ParallelismType.PIPELINE_PARALLEL,
+                data_parallel_size=max(1, config.data_parallel_size // 2),
+                pipeline_parallel_size=2,
+                pipeline_chunks=8
             )
-        # Otherwise, adjust micro-batch size
-        else:
+        elif config.strategy_type == ParallelismType.TENSOR_PARALLEL:
+            # Reduce tensor parallel size
             return ParallelismConfig(
-                **{**config.__dict__,
-                   'micro_batch_size': max(1, config.micro_batch_size // 2)}
+                strategy_type=ParallelismType.TENSOR_PARALLEL,
+                tensor_parallel_size=max(2, config.tensor_parallel_size // 2)
             )
-
+        return config
+        
+    def _adjust_for_utilization_bottleneck(self, config: ParallelismConfig) -> ParallelismConfig:
+        """Adjust strategy to address GPU utilization bottleneck."""
+        if config.strategy_type == ParallelismType.PIPELINE_PARALLEL:
+            # Switch to data parallel for better utilization
+            return ParallelismConfig(
+                strategy_type=ParallelismType.DATA_PARALLEL,
+                data_parallel_size=config.pipeline_parallel_size * 2
+            )
+        elif config.strategy_type == ParallelismType.HYBRID:
+            # Simplify to just tensor parallel
+            return ParallelismConfig(
+                strategy_type=ParallelismType.TENSOR_PARALLEL,
+                tensor_parallel_size=config.tensor_parallel_size
+            )
+        return config
+    
+    def _evaluate_current_performance(self) -> Dict[str, float]:
+        """Evaluate current training performance metrics."""
+        recent_metrics = self.metrics_history[-self.history_window:]
+        
+        avg_throughput = np.mean([m.throughput for m in recent_metrics])
+        avg_gpu_util = np.mean([sum(m.gpu_utilization.values()) / len(m.gpu_utilization)
+                              for m in recent_metrics])
+        avg_comm_overhead = np.mean([m.communication_overhead for m in recent_metrics])
+        
+        return {
+            'throughput': avg_throughput,
+            'gpu_utilization': avg_gpu_util,
+            'communication_overhead': avg_comm_overhead,
+            'memory_utilization': np.mean([sum(m.gpu_memory_used.values()) / 
+                                         sum(m.memory_reserved.values())
+                                         for m in recent_metrics])
+        }
+    
+    def _should_adapt(self, current_performance: Dict[str, float]) -> bool:
+        """Determine if strategy adaptation is needed."""
+        if len(self.metrics_history) < self.history_window * 2:
+            return False
+            
+        prev_metrics = self.metrics_history[-self.history_window*2:-self.history_window]
+        prev_throughput = np.mean([m.throughput for m in prev_metrics])
+        
+        throughput_change = ((current_performance['throughput'] - prev_throughput) / 
+                           prev_throughput)
+        
+        return (abs(throughput_change) > self.adaptation_threshold or
+                current_performance['gpu_utilization'] < 0.5 or
+                current_performance['memory_utilization'] > 0.95)
+    
+    def _select_new_strategy(self, current_performance: Dict[str, float]) -> ParallelismConfig:
+        """Select a new parallelism strategy based on current performance."""
+        bottlenecks = self._identify_bottlenecks(current_performance)
+        return self._adjust_strategy_for_bottlenecks(self.current_config, bottlenecks)
+    
+    def _identify_bottlenecks(self, performance: Dict[str, float]) -> Dict[str, float]:
+        """Identify performance bottlenecks from metrics."""
+        bottlenecks = {}
+        
+        if performance['memory_utilization'] > 0.9:
+            bottlenecks['memory'] = performance['memory_utilization']
+            
+        if performance['communication_overhead'] > 0.3:
+            bottlenecks['communication'] = performance['communication_overhead']
+            
+        if performance['gpu_utilization'] < 0.5:
+            bottlenecks['utilization'] = performance['gpu_utilization']
+            
+        return bottlenecks
+    
     def _log_strategy_change(self, new_config: ParallelismConfig):
         """Log details of parallelism strategy change."""
         self.logger.info(f"Adapting parallelism strategy:")
-        self.logger.info(f"New configuration: {json.dumps(new_config.__dict__, indent=2)}")
+        self.logger.info(f"- Data Parallel Size: {new_config.data_parallel_size}")
+        self.logger.info(f"- Tensor Parallel Size: {new_config.tensor_parallel_size}")
+        self.logger.info(f"- Pipeline Parallel Size: {new_config.pipeline_parallel_size}")
+        self.logger.info(f"- Micro Batch Size: {new_config.micro_batch_size}")
+        self.logger.info(f"- Gradient Accumulation Steps: {new_config.gradient_accumulation_steps}")
+        self.logger.info(f"- ZeRO Stage: {new_config.zero_optimization_stage}")
         
-        if len(self.strategy_changes) > 1:
-            prev_config = self.strategy_changes[-2][1]
-            self.logger.info("Changes from previous configuration:")
-            for key, new_value in new_config.__dict__.items():
-                old_value = getattr(prev_config, key)
-                if new_value != old_value:
-                    self.logger.info(f"  {key}: {old_value} -> {new_value}")
-
     def get_current_strategy(self) -> ParallelismConfig:
         """Get the current parallelism strategy configuration."""
         return self.current_config
-
+    
     def get_strategy_history(self) -> List[Tuple[int, ParallelismConfig]]:
         """Get the history of strategy changes."""
         return self.strategy_changes
-
+    
     def export_metrics_history(self, filepath: str):
         """Export metrics history to a JSON file."""
-        history_data = []
-        for metrics in self.metrics_history:
-            history_data.append({
-                'timestamp': metrics.timestamp,
-                'throughput': metrics.throughput,
-                'gpu_memory_used': metrics.gpu_memory_used,
-                'cpu_memory_used': metrics.cpu_memory_used,
-                'communication_overhead': metrics.communication_overhead,
-                'load_imbalance': metrics.load_imbalance,
-                'convergence': metrics.convergence_rate
+        history = []
+        for metric in self.metrics_history:
+            history.append({
+                'timestamp': metric.timestamp,
+                'iteration': metric.iteration,
+                'throughput': metric.throughput,
+                'gpu_memory_used': metric.gpu_memory_used,
+                'gpu_utilization': metric.gpu_utilization,
+                'communication_overhead': metric.communication_overhead
             })
             
         with open(filepath, 'w') as f:
-            json.dump(history_data, f, indent=2)
-
+            json.dump(history, f, indent=2)
+            
     def export_strategy_history(self, filepath: str):
         """Export strategy change history to a JSON file."""
-        history_data = []
+        history = []
         for iteration, config in self.strategy_changes:
-            history_data.append({
+            history.append({
                 'iteration': iteration,
-                'config': config.__dict__
+                'strategy_type': config.strategy_type.value,
+                'data_parallel_size': config.data_parallel_size,
+                'tensor_parallel_size': config.tensor_parallel_size,
+                'pipeline_parallel_size': config.pipeline_parallel_size,
+                'micro_batch_size': config.micro_batch_size,
+                'gradient_accumulation_steps': config.gradient_accumulation_steps,
+                'zero_optimization_stage': config.zero_optimization_stage
             })
             
         with open(filepath, 'w') as f:
-            json.dump(history_data, f, indent=2)
+            json.dump(history, f, indent=2)

@@ -1,84 +1,163 @@
 """
 Hardware Profiler for Optimus-Megatron
-Detects and profiles hardware resources for optimal parallelization strategy.
+Analyzes hardware resources and capabilities for optimal parallelization strategy.
 """
 
 import torch
 import torch.cuda as cuda
-from typing import Dict, List, Optional, Tuple
-import numpy as np
+import torch.distributed as dist
+from typing import Dict, List, Optional, Any, Tuple
 import psutil
-import os
-import subprocess
+import logging
+import json
 from dataclasses import dataclass
 import time
+from enum import Enum
+import platform
+from pathlib import Path
 
-# Megatron-specific imports
-from megatron import get_args
-from megatron.model.distributed import DistributedDataParallel
-from megatron.mpu import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_data_parallel_group,
-    get_data_parallel_world_size,
-    get_data_parallel_rank,
-    get_pipeline_model_parallel_group,
-    get_pipeline_model_parallel_world_size,
-    get_pipeline_model_parallel_rank
-)
+class InterconnectType(Enum):
+    """Types of GPU interconnects."""
+    NVLINK = "nvlink"
+    PCIE = "pcie"
+    INFINITY_FABRIC = "infinity_fabric"
+    OTHER = "other"
 
 @dataclass
 class GPUInfo:
+    """Detailed information about a single GPU."""
     index: int
     total_memory: int  # in bytes
+    free_memory: int  # in bytes
     compute_capability: tuple
     name: str
     nvlink_connected_gpus: List[int]
     pcie_bandwidth: float  # GB/s
+    memory_bandwidth: float  # GB/s
+    compute_capability_features: Dict[str, bool]
+    temperature: float  # in Celsius
+    power_usage: float  # in Watts
+    power_limit: float  # in Watts
+    utilization: float  # percentage
 
 @dataclass
 class SystemInfo:
+    """Comprehensive system hardware information."""
     cpu_count: int
+    cpu_physical_cores: int
+    cpu_frequency: float  # GHz
     total_memory: int  # in bytes
+    free_memory: int  # in bytes
     gpu_count: int
     gpu_infos: List[GPUInfo]
     network_bandwidth: float  # GB/s
-    interconnect_type: str  # 'NVLink' or 'PCIe'
+    interconnect_type: InterconnectType
+    numa_nodes: int
+    cpu_architecture: str
+    os_info: Dict[str, str]
+    memory_speed: float  # MHz
+    swap_space: int  # bytes
 
 class HardwareProfiler:
+    """Analyzes and profiles hardware resources for optimal model parallelization."""
+    
     def __init__(self):
+        """Initialize the hardware profiler with logging configuration."""
+        self.logger = logging.getLogger(__name__)
         self.system_info = self._profile_system()
         self._memory_bandwidth_cache = {}
         self._compute_throughput_cache = {}
+        self._topology_graph = self._build_topology_graph()
+        self._parallel_groups = self._initialize_parallel_groups() if dist.is_initialized() else None
+
+    def _initialize_parallel_groups(self):
+        """Initialize parallel process groups using PyTorch distributed."""
+        if not dist.is_initialized():
+            return None
+            
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        
+        # Create default process group for data parallelism
+        data_parallel_group = dist.new_group(ranks=list(range(world_size)))
+        
+        # For tensor parallelism, we'll create groups based on available GPUs
+        gpu_count = torch.cuda.device_count()
+        tensor_parallel_size = min(gpu_count, world_size)
+        tensor_parallel_groups = []
+        
+        for i in range(world_size // tensor_parallel_size):
+            ranks = list(range(i * tensor_parallel_size, (i + 1) * tensor_parallel_size))
+            group = dist.new_group(ranks=ranks)
+            tensor_parallel_groups.append(group)
+        
+        return {
+            'data_parallel': data_parallel_group,
+            'tensor_parallel': tensor_parallel_groups[rank // tensor_parallel_size] if tensor_parallel_groups else None,
+            'world_size': world_size,
+            'rank': rank,
+            'tensor_parallel_size': tensor_parallel_size
+        }
 
     def _profile_system(self) -> SystemInfo:
         """Profile the complete system hardware configuration."""
-        gpu_infos = []
-        gpu_count = torch.cuda.device_count()
+        try:
+            gpu_infos = []
+            gpu_count = torch.cuda.device_count()
 
-        for i in range(gpu_count):
-            props = torch.cuda.get_device_properties(i)
-            nvlink_gpus = self._detect_nvlink_connections(i)
-            pcie_bandwidth = self._measure_pcie_bandwidth(i)
+            for i in range(gpu_count):
+                gpu_infos.append(self._profile_gpu(i))
+
+            cpu_info = self._get_cpu_info()
+            memory_info = self._get_memory_info()
+            network_info = self._get_network_info()
+
+            return SystemInfo(
+                cpu_count=cpu_info["cpu_count"],
+                cpu_physical_cores=cpu_info["physical_cores"],
+                cpu_frequency=cpu_info["frequency"],
+                total_memory=memory_info["total"],
+                free_memory=memory_info["free"],
+                gpu_count=gpu_count,
+                gpu_infos=gpu_infos,
+                network_bandwidth=network_info["bandwidth"],
+                interconnect_type=self._determine_interconnect_type(gpu_infos),
+                numa_nodes=self._get_numa_nodes(),
+                cpu_architecture=cpu_info["architecture"],
+                os_info=self._get_os_info(),
+                memory_speed=memory_info["speed"],
+                swap_space=memory_info["swap"]
+            )
+        except Exception as e:
+            self.logger.error(f"Error during system profiling: {str(e)}")
+            raise
+
+    def _profile_gpu(self, gpu_index: int) -> GPUInfo:
+        """Profile a specific GPU device comprehensively."""
+        try:
+            props = torch.cuda.get_device_properties(gpu_index)
+            nvlink_gpus = self._detect_nvlink_connections(gpu_index)
+            pcie_bandwidth = self._measure_pcie_bandwidth(gpu_index)
+            memory_info = self._get_gpu_memory_info(gpu_index)
             
-            gpu_infos.append(GPUInfo(
-                index=i,
+            return GPUInfo(
+                index=gpu_index,
                 total_memory=props.total_memory,
+                free_memory=memory_info["free"],
                 compute_capability=(props.major, props.minor),
                 name=props.name,
                 nvlink_connected_gpus=nvlink_gpus,
-                pcie_bandwidth=pcie_bandwidth
-            ))
-
-        return SystemInfo(
-            cpu_count=psutil.cpu_count(logical=True),
-            total_memory=psutil.virtual_memory().total,
-            gpu_count=gpu_count,
-            gpu_infos=gpu_infos,
-            network_bandwidth=self._measure_network_bandwidth(),
-            interconnect_type=self._determine_interconnect_type(gpu_infos)
-        )
+                pcie_bandwidth=pcie_bandwidth,
+                memory_bandwidth=self._measure_memory_bandwidth(gpu_index),
+                compute_capability_features=self._get_compute_features(props),
+                temperature=self._get_gpu_temperature(gpu_index),
+                power_usage=self._get_gpu_power_usage(gpu_index),
+                power_limit=self._get_gpu_power_limit(gpu_index),
+                utilization=self._get_gpu_utilization(gpu_index)
+            )
+        except Exception as e:
+            self.logger.error(f"Error profiling GPU {gpu_index}: {str(e)}")
+            raise
 
     def _detect_nvlink_connections(self, gpu_index: int) -> List[int]:
         """Detect NVLink connections for a given GPU."""
@@ -93,224 +172,258 @@ class HardwareProfiler:
         # This is a placeholder implementation
         return 16.0  # GB/s typical for PCIe 3.0 x16
 
-    def _measure_network_bandwidth(self) -> float:
-        """Measure available network bandwidth between nodes."""
-        # This is a placeholder implementation
-        # In practice, this would perform actual network bandwidth measurements
-        return 100.0  # GB/s typical for modern interconnects
-
-    def _determine_interconnect_type(self, gpu_infos: List[GPUInfo]) -> str:
-        """Determine the primary interconnect type being used."""
-        has_nvlink = any(len(gpu.nvlink_connected_gpus) > 0 for gpu in gpu_infos)
-        return 'NVLink' if has_nvlink else 'PCIe'
-
-    def get_memory_bandwidth(self, gpu_index: int) -> float:
-        """Measure memory bandwidth for a specific GPU."""
-        if gpu_index not in self._memory_bandwidth_cache:
-            self._memory_bandwidth_cache[gpu_index] = self._measure_memory_bandwidth(gpu_index)
-        return self._memory_bandwidth_cache[gpu_index]
-
     def _measure_memory_bandwidth(self, gpu_index: int) -> float:
-        """Perform actual memory bandwidth measurement."""
+        """Measure memory bandwidth for a specific GPU."""
         # Implement memory bandwidth measurement using CUDA events and large memory transfers
         # This is a placeholder implementation
         return 900.0  # GB/s typical for modern GPUs
 
-    def get_compute_throughput(self, gpu_index: int) -> float:
-        """Measure compute throughput for a specific GPU."""
-        if gpu_index not in self._compute_throughput_cache:
-            self._compute_throughput_cache[gpu_index] = self._measure_compute_throughput(gpu_index)
-        return self._compute_throughput_cache[gpu_index]
-
-    def _measure_compute_throughput(self, gpu_index: int) -> float:
-        """Perform actual compute throughput measurement."""
-        # Implement compute throughput measurement using matrix multiplications
+    def _get_compute_features(self, props) -> Dict[str, bool]:
+        """Get compute features for a given GPU."""
         # This is a placeholder implementation
-        return 19.5  # TFLOPS typical for modern GPUs
+        # In practice, this would use NVIDIA Management Library (NVML) to detect actual compute features
+        features = {
+            "double_precision": True,
+            "single_precision": True,
+            "half_precision": True,
+            "tensor_cores": True
+        }
+        return features
 
-    def get_optimal_device_mapping(self, num_gpus_needed: int) -> List[int]:
-        """Determine optimal GPU mapping based on topology and bandwidth."""
-        available_gpus = list(range(self.system_info.gpu_count))
-        
-        # Sort GPUs by their interconnect bandwidth and compute capability
-        gpu_scores = []
-        for gpu in self.system_info.gpu_infos:
-            score = (
-                len(gpu.nvlink_connected_gpus) * 1000 +  # Prioritize NVLink connections
-                gpu.pcie_bandwidth +
-                self.get_compute_throughput(gpu.index)
-            )
-            gpu_scores.append((gpu.index, score))
-        
-        gpu_scores.sort(key=lambda x: x[1], reverse=True)
-        return [gpu[0] for gpu in gpu_scores[:num_gpus_needed]]
+    def _get_gpu_temperature(self, gpu_index: int) -> float:
+        """Get temperature for a given GPU."""
+        # This is a placeholder implementation
+        # In practice, this would use NVIDIA Management Library (NVML) to detect actual GPU temperature
+        return 50.0  # Celsius
 
-    def get_hardware_recommendation(self) -> Dict:
-        """Generate hardware-aware recommendations for parallelism strategies."""
-        gpu_memory = min(gpu.total_memory for gpu in self.system_info.gpu_infos)
-        has_nvlink = self.system_info.interconnect_type == 'NVLink'
+    def _get_gpu_power_usage(self, gpu_index: int) -> float:
+        """Get power usage for a given GPU."""
+        # This is a placeholder implementation
+        # In practice, this would use NVIDIA Management Library (NVML) to detect actual GPU power usage
+        return 250.0  # Watts
+
+    def _get_gpu_power_limit(self, gpu_index: int) -> float:
+        """Get power limit for a given GPU."""
+        # This is a placeholder implementation
+        # In practice, this would use NVIDIA Management Library (NVML) to detect actual GPU power limit
+        return 300.0  # Watts
+
+    def _get_gpu_utilization(self, gpu_index: int) -> float:
+        """Get utilization for a given GPU."""
+        # This is a placeholder implementation
+        # In practice, this would use NVIDIA Management Library (NVML) to detect actual GPU utilization
+        return 50.0  # percentage
+
+    def _get_cpu_info(self) -> Dict[str, Any]:
+        """Get CPU information."""
+        cpu_info = {
+            "cpu_count": psutil.cpu_count(logical=True),
+            "physical_cores": psutil.cpu_count(logical=False),
+            "frequency": psutil.cpu_freq().current / 1000,  # GHz
+            "architecture": platform.machine()
+        }
+        return cpu_info
+
+    def _get_memory_info(self) -> Dict[str, Any]:
+        """Get memory information."""
+        memory_info = {
+            "total": psutil.virtual_memory().total,
+            "free": psutil.virtual_memory().available,
+            "speed": 3200  # MHz, typical for DDR4
+        }
+        return memory_info
+
+    def _get_network_info(self) -> Dict[str, Any]:
+        """Get network information."""
+        network_info = {
+            "bandwidth": 100.0  # GB/s, typical for modern interconnects
+        }
+        return network_info
+
+    def _get_numa_nodes(self) -> int:
+        """Get number of NUMA nodes."""
+        return len(psutil.cpu_count(logical=False))
+
+    def _get_os_info(self) -> Dict[str, str]:
+        """Get OS information."""
+        os_info = {
+            "name": platform.system(),
+            "version": platform.release(),
+            "architecture": platform.machine()
+        }
+        return os_info
+
+    def _determine_interconnect_type(self, gpu_infos: List[GPUInfo]) -> InterconnectType:
+        """Determine the primary interconnect type being used."""
+        has_nvlink = any(len(gpu.nvlink_connected_gpus) > 0 for gpu in gpu_infos)
+        if has_nvlink:
+            return InterconnectType.NVLINK
+        else:
+            return InterconnectType.PCIE
+
+    def _build_topology_graph(self) -> Dict[str, Any]:
+        """Build a graph representing the system topology."""
+        # This is a placeholder implementation
+        # In practice, this would use a graph library to build a graph representing the system topology
+        topology_graph = {
+            "nodes": [],
+            "edges": []
+        }
+        return topology_graph
+
+    def get_parallel_group_info(self) -> Dict[str, Any]:
+        """Get information about parallel process groups."""
+        if not self._parallel_groups:
+            return {}
         
         return {
-            'tensor_parallel_size': 2 if has_nvlink else 1,
-            'pipeline_parallel_size': 2 if self.system_info.gpu_count >= 4 else 1,
-            'data_parallel_size': max(1, self.system_info.gpu_count // 4),
-            'optimal_batch_size': self._calculate_optimal_batch_size(gpu_memory),
-            'activation_checkpointing': gpu_memory < 32 * (1024**3),  # Use if less than 32GB
-            'recommended_precision': 'fp16' if gpu_memory < 40 * (1024**3) else 'fp32'
-        }
-
-    def _calculate_optimal_batch_size(self, gpu_memory: int) -> int:
-        """Calculate optimal batch size based on available GPU memory."""
-        # This is a simplified calculation
-        # In practice, this would consider model size, activation memory, and other factors
-        base_batch_size = 32
-        memory_factor = gpu_memory / (32 * (1024**3))  # Normalize to 32GB
-        return max(1, int(base_batch_size * memory_factor))
-
-    def print_system_info(self):
-        """Print detailed system information."""
-        print(f"System Configuration:")
-        print(f"CPU Cores: {self.system_info.cpu_count}")
-        print(f"Total System Memory: {self.system_info.total_memory / (1024**3):.2f} GB")
-        print(f"GPU Count: {self.system_info.gpu_count}")
-        print(f"Interconnect Type: {self.system_info.interconnect_type}")
-        print(f"Network Bandwidth: {self.system_info.network_bandwidth:.2f} GB/s")
-        print("\nGPU Details:")
-        for gpu in self.system_info.gpu_infos:
-            print(f"\nGPU {gpu.index}:")
-            print(f"  Name: {gpu.name}")
-            print(f"  Memory: {gpu.total_memory / (1024**3):.2f} GB")
-            print(f"  Compute Capability: {gpu.compute_capability}")
-            print(f"  NVLink Connected GPUs: {gpu.nvlink_connected_gpus}")
-            print(f"  PCIe Bandwidth: {gpu.pcie_bandwidth:.2f} GB/s")
-
-    def detect_gpu_capabilities(self) -> Dict:
-        """Detect GPU capabilities and configurations."""
-        if not torch.cuda.is_available():
-            return {'error': 'No CUDA-capable GPUs detected'}
-        
-        gpu_info = {}
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            gpu_info[f'gpu_{i}'] = {
-                'name': props.name,
-                'compute_capability': f'{props.major}.{props.minor}',
-                'total_memory': props.total_memory,
-                'memory_bandwidth': self._measure_memory_bandwidth(i),
-                'tensor_cores': props.major >= 7,
-                'multi_processor_count': props.multi_processor_count,
-                'max_threads_per_block': props.max_threads_per_block,
-                'max_shared_memory_per_block': props.max_shared_memory_per_block,
-                'tensor_parallel_rank': get_tensor_model_parallel_rank(),
-                'data_parallel_rank': get_data_parallel_rank(),
-                'pipeline_parallel_rank': get_pipeline_model_parallel_rank()
-            }
-        
-        return gpu_info
-
-    def detect_network_topology(self) -> Dict:
-        """Detect network interconnect topology and capabilities."""
-        args = get_args()
-        
-        topology = {
             'tensor_parallel': {
-                'world_size': get_tensor_model_parallel_world_size(),
-                'group': str(get_tensor_model_parallel_group()),
-                'rank': get_tensor_model_parallel_rank()
+                'world_size': self._parallel_groups['world_size'],
+                'rank': self._parallel_groups['rank']
             },
             'data_parallel': {
-                'world_size': get_data_parallel_world_size(),
-                'group': str(get_data_parallel_group()),
-                'rank': get_data_parallel_rank()
+                'world_size': self._parallel_groups['world_size'],
+                'rank': self._parallel_groups['rank']
             },
             'pipeline_parallel': {
-                'world_size': get_pipeline_model_parallel_world_size(),
-                'group': str(get_pipeline_model_parallel_group()),
-                'rank': get_pipeline_model_parallel_rank()
+                'world_size': self._parallel_groups['world_size'],
+                'rank': self._parallel_groups['rank']
             }
         }
-        
-        # Measure network bandwidth between GPUs
-        if torch.cuda.device_count() > 1:
-            topology['inter_gpu_bandwidth'] = self._measure_gpu_interconnect()
-        
-        # Detect NCCL/GLOO backend and version
-        topology['distributed_backend'] = {
-            'nccl_version': torch.cuda.nccl.version() if hasattr(torch.cuda, 'nccl') else None,
-            'gloo_available': hasattr(torch.distributed, 'GlooBackend'),
-            'current_backend': torch.distributed.get_backend() 
-                if torch.distributed.is_initialized() else None
+
+    def get_hardware_characteristics(self) -> Dict[str, Any]:
+        """Get hardware characteristics for strategy selection."""
+        return {
+            'gpu_count': self.system_info.gpu_count,
+            'gpu_memory': [gpu.total_memory for gpu in self.system_info.gpu_infos],
+            'gpu_compute_capability': [gpu.compute_capability for gpu in self.system_info.gpu_infos],
+            'interconnect': self.system_info.interconnect_type.value,
+            'network_bandwidth': self.system_info.network_bandwidth,
+            'memory_per_gpu': self.system_info.gpu_infos[0].total_memory if self.system_info.gpu_infos else 0,
+            'nvlink_groups': [gpu.nvlink_connected_gpus for gpu in self.system_info.gpu_infos],
+            'parallel_groups': self.get_parallel_group_info()
         }
-        
-        return topology
 
-    def _measure_gpu_interconnect(self, size_mb: int = 100) -> Dict:
-        """Measure GPU interconnect bandwidth."""
-        if not torch.cuda.is_available():
+    def get_current_metrics(self) -> Dict[str, Any]:
+        """Get current hardware metrics for monitoring."""
+        metrics = {}
+        try:
+            metrics['gpu_memory_used'] = {
+                i: self._get_gpu_memory_info(i)['used'] 
+                for i in range(self.system_info.gpu_count)
+            }
+            metrics['gpu_utilization'] = {
+                i: self._get_gpu_utilization(i) 
+                for i in range(self.system_info.gpu_count)
+            }
+            metrics['temperature'] = {
+                i: self._get_gpu_temperature(i) 
+                for i in range(self.system_info.gpu_count)
+            }
+            metrics['power_usage'] = {
+                i: self._get_gpu_power_usage(i) 
+                for i in range(self.system_info.gpu_count)
+            }
+            
+            if dist.is_initialized():
+                metrics['communication_overhead'] = self._measure_communication_overhead()
+            
+            return metrics
+        except Exception as e:
+            self.logger.error(f"Error getting current metrics: {str(e)}")
             return {}
-        
-        num_gpus = torch.cuda.device_count()
-        if num_gpus < 2:
-            return {}
-        
-        bandwidth_matrix = {}
-        tensor_size = size_mb * 1024 * 1024 // 4  # Convert to number of float32
-        
-        for src in range(num_gpus):
-            bandwidth_matrix[src] = {}
-            for dst in range(num_gpus):
-                if src != dst:
-                    # Skip if GPUs are not in the same process group
-                    if not self._are_gpus_in_same_group(src, dst):
-                        continue
-                    
-                    with torch.cuda.device(src):
-                        send_tensor = torch.randn(tensor_size, dtype=torch.float32, device=f'cuda:{src}')
-                    
-                    with torch.cuda.device(dst):
-                        recv_tensor = torch.empty(tensor_size, dtype=torch.float32, device=f'cuda:{dst}')
-                    
-                    # Warmup
-                    for _ in range(5):
-                        recv_tensor.copy_(send_tensor)
-                    
-                    torch.cuda.synchronize(src)
-                    torch.cuda.synchronize(dst)
-                    
-                    # Measure bandwidth
-                    start = torch.cuda.Event(enable_timing=True)
-                    end = torch.cuda.Event(enable_timing=True)
-                    
-                    start.record()
-                    for _ in range(10):
-                        recv_tensor.copy_(send_tensor)
-                    end.record()
-                    
-                    torch.cuda.synchronize(src)
-                    torch.cuda.synchronize(dst)
-                    
-                    elapsed_time = start.elapsed_time(end) / 1000  # Convert to seconds
-                    bandwidth = (size_mb * 10) / elapsed_time  # MB/s
-                    
-                    bandwidth_matrix[src][dst] = bandwidth
-        
-        return bandwidth_matrix
 
-    def _are_gpus_in_same_group(self, gpu1: int, gpu2: int) -> bool:
-        """Check if two GPUs are in the same process group."""
-        # Check tensor parallel group
-        if (get_tensor_model_parallel_rank(gpu1) is not None and 
-            get_tensor_model_parallel_rank(gpu2) is not None):
-            return True
+    def _measure_communication_overhead(self) -> float:
+        """Measure communication overhead between devices."""
+        if not dist.is_initialized():
+            return 0.0
         
-        # Check data parallel group
-        if (get_data_parallel_rank(gpu1) is not None and 
-            get_data_parallel_rank(gpu2) is not None):
-            return True
-        
-        # Check pipeline parallel group
-        if (get_pipeline_model_parallel_rank(gpu1) is not None and 
-            get_pipeline_model_parallel_rank(gpu2) is not None):
-            return True
-        
-        return False
+        try:
+            # Measure all-reduce time for a small tensor
+            tensor = torch.randn(1024, 1024, device='cuda')
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            
+            start.record()
+            dist.all_reduce(tensor)
+            end.record()
+            
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / 1000  # Convert to seconds
+        except Exception as e:
+            self.logger.error(f"Error measuring communication overhead: {str(e)}")
+            return 0.0
+
+    def export_profile(self, filepath: Optional[str] = None) -> Dict[str, Any]:
+        """Export hardware profile to a JSON file and return as dictionary."""
+        profile_data = {
+            "timestamp": time.time(),
+            "system_info": {
+                "cpu_count": self.system_info.cpu_count,
+                "cpu_physical_cores": self.system_info.cpu_physical_cores,
+                "cpu_frequency": self.system_info.cpu_frequency,
+                "total_memory": self.system_info.total_memory,
+                "free_memory": self.system_info.free_memory,
+                "gpu_count": self.system_info.gpu_count,
+                "network_bandwidth": self.system_info.network_bandwidth,
+                "interconnect_type": self.system_info.interconnect_type.value,
+                "numa_nodes": self.system_info.numa_nodes,
+                "cpu_architecture": self.system_info.cpu_architecture,
+                "os_info": self.system_info.os_info,
+                "memory_speed": self.system_info.memory_speed,
+                "swap_space": self.system_info.swap_space
+            },
+            "gpus": [self._gpu_info_to_dict(gpu) for gpu in self.system_info.gpu_infos],
+            "topology": self._topology_to_dict(),
+            "performance_metrics": self._get_performance_metrics()
+        }
+
+        if filepath:
+            try:
+                with open(filepath, 'w') as f:
+                    json.dump(profile_data, f, indent=2)
+                self.logger.info(f"Hardware profile exported to {filepath}")
+            except Exception as e:
+                self.logger.error(f"Error exporting profile to {filepath}: {str(e)}")
+                raise
+
+        return profile_data
+
+    def _gpu_info_to_dict(self, gpu: GPUInfo) -> Dict[str, Any]:
+        """Convert GPUInfo to a dictionary."""
+        gpu_dict = {
+            "index": gpu.index,
+            "total_memory": gpu.total_memory,
+            "free_memory": gpu.free_memory,
+            "compute_capability": gpu.compute_capability,
+            "name": gpu.name,
+            "nvlink_connected_gpus": gpu.nvlink_connected_gpus,
+            "pcie_bandwidth": gpu.pcie_bandwidth,
+            "memory_bandwidth": gpu.memory_bandwidth,
+            "compute_capability_features": gpu.compute_capability_features,
+            "temperature": gpu.temperature,
+            "power_usage": gpu.power_usage,
+            "power_limit": gpu.power_limit,
+            "utilization": gpu.utilization
+        }
+        return gpu_dict
+
+    def _topology_to_dict(self) -> Dict[str, Any]:
+        """Convert topology graph to a dictionary."""
+        # This is a placeholder implementation
+        # In practice, this would use a graph library to convert the topology graph to a dictionary
+        topology_dict = {
+            "nodes": [],
+            "edges": []
+        }
+        return topology_dict
+
+    def _get_performance_metrics(self) -> Dict[str, Any]:
+        """Get performance metrics."""
+        # This is a placeholder implementation
+        # In practice, this would use a benchmarking library to get actual performance metrics
+        performance_metrics = {
+            "memory_bandwidth": 900.0,  # GB/s
+            "compute_throughput": 19.5  # TFLOPS
+        }
+        return performance_metrics
