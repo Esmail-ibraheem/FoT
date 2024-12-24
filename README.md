@@ -1,4 +1,4 @@
-# [DynaMixTron](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
+# [Galvatron](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
 
 ### DynaMixTron : A Dynamic Mixture-Based Framework in Training Multi-Trillion Parameter Language Models
 
