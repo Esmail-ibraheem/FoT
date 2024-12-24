@@ -1,10 +1,11 @@
 # [DynaMixTron](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
 
+### DynaMixTron : A Dynamic Mixture-Based Framework in Training Multi-Trillion Parameter Language Models
 
 ![Optimus-Megatron drawio](https://github.com/user-attachments/assets/48bccab0-7475-49db-a3f2-16d0f5d8e484)
 
 
-### Factory of Transformers (FoT): A Dynamic Mixture-Based Framework for Scalable Transformer Training.
+
 
 ### **Abstract**
 
