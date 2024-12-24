@@ -1,4 +1,4 @@
-# [Factory of Transformers (FoT)](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
+# [DynaMixTron](https://github.com/Esmail-ibraheem/Optimus-Megatron/tree/main/core)
 
 
 ![Optimus-Megatron drawio](https://github.com/user-attachments/assets/48bccab0-7475-49db-a3f2-16d0f5d8e484)
